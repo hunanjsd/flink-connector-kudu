@@ -16,29 +16,26 @@
  */
 package org.colloh.flink.kudu.connector.internal.writer;
 
+import lombok.SneakyThrows;
+import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.kudu.ColumnSchema;
-import org.apache.kudu.client.Delete;
-import org.apache.kudu.client.KuduPredicate;
-import org.apache.kudu.client.KuduScanner;
+import org.apache.kudu.client.*;
 import org.colloh.flink.kudu.connector.internal.KuduTableInfo;
 import org.colloh.flink.kudu.connector.internal.failure.DefaultKuduFailureHandler;
 import org.colloh.flink.kudu.connector.internal.failure.KuduFailureHandler;
 
-import org.apache.kudu.client.DeleteTableResponse;
-import org.apache.kudu.client.KuduClient;
-import org.apache.kudu.client.KuduSession;
-import org.apache.kudu.client.KuduTable;
-import org.apache.kudu.client.Operation;
-import org.apache.kudu.client.OperationResponse;
-import org.apache.kudu.client.RowError;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Timer;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * todo write kudu table config
@@ -59,6 +56,11 @@ public class KuduWriter<T> implements AutoCloseable {
     private final transient KuduSession session;
     private final transient KuduTable table;
 
+    private static final String MANUAL_FLUSH_BUFFER_FULL = "MANUAL_FLUSH is enabled but the buffer is too big";
+
+    private ScheduledExecutorService executorService = new ScheduledThreadPoolExecutor(1,
+            new BasicThreadFactory.Builder().namingPattern("kudu-flush-schedule-pool-%d").daemon(true).build());
+
     public KuduWriter(KuduTableInfo tableInfo, KuduWriterConfig writerConfig,
                       AbstractSingleOperationMapper<T> operationMapper) throws IOException {
         this(tableInfo, writerConfig, operationMapper, new DefaultKuduFailureHandler());
@@ -77,6 +79,18 @@ public class KuduWriter<T> implements AutoCloseable {
         this.session = obtainSession();
         this.table = obtainTable();
         this.operationMapper = operationMapper;
+
+        executorService.scheduleAtFixedRate(new Runnable() {
+            @SneakyThrows
+            @Override
+            public void run() {
+                try {
+                    session.flush();
+                } catch (KuduException e) {
+                    checkAsyncErrors();
+                }
+            }
+        },10,1, TimeUnit.SECONDS);
     }
 
     private KuduClient obtainClient() {
@@ -105,7 +119,22 @@ public class KuduWriter<T> implements AutoCloseable {
         checkAsyncErrors();
 
         for (Operation operation : operationMapper.createOperations(input, table)) {
-            checkErrors(session.apply(operation));
+            // 针对MANUAL_FLUSH模式，要手工flush
+            // MANUAL_FLUSH: the call returns when the operation has been added to the buffer,
+            // else it throws a KuduException if the buffer is full.
+            if (session.getFlushMode() == SessionConfiguration.FlushMode.MANUAL_FLUSH) {
+                try {
+                    session.apply(operation);
+                } catch (KuduException e) {
+                    if (MANUAL_FLUSH_BUFFER_FULL.equals(e.getMessage())) {
+                        session.flush();
+                        // buffer满了以后，下一条数据没有处理到，会丢数据
+                        session.apply(operation);
+                    }
+                }
+            } else {
+                checkErrors(session.apply(operation));
+            }
         }
     }
 
